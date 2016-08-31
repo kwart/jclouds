@@ -29,6 +29,7 @@ import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
 
+import com.google.common.base.Charsets;
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -53,30 +54,35 @@ import org.jclouds.docker.domain.ContainerSummary;
 import org.jclouds.docker.domain.HostConfig;
 import org.jclouds.docker.domain.Image;
 import org.jclouds.docker.domain.ImageSummary;
+import org.jclouds.docker.features.ContainerApi;
+import org.jclouds.docker.options.AttachOptions;
 import org.jclouds.docker.options.CreateImageOptions;
 import org.jclouds.docker.options.ListContainerOptions;
 import org.jclouds.docker.options.RemoveContainerOptions;
+import org.jclouds.docker.util.DockerInputStream;
+import org.jclouds.docker.util.StdStreamData;
 import org.jclouds.domain.Location;
 import org.jclouds.domain.LoginCredentials;
 import org.jclouds.logging.Logger;
+import org.jclouds.util.Closeables2;
 
 /**
- * defines the connection between the {@link org.jclouds.docker.DockerApi} implementation and
- * the jclouds {@link org.jclouds.compute.ComputeService}
+ * defines the connection between the {@link org.jclouds.docker.DockerApi}
+ * implementation and the jclouds {@link org.jclouds.compute.ComputeService}
  */
 @Singleton
-public class DockerComputeServiceAdapter implements
-        ComputeServiceAdapter<Container, Hardware, Image, Location> {
-
+public class DockerComputeServiceAdapter implements ComputeServiceAdapter<Container, Hardware, Image, Location> {
 
    /**
-    * Some Docker versions returns host prefix even for images from Docker hub in repoTags field. We use this constant
-    * to correctly identify requested image name.
+    * Some Docker versions returns host prefix even for images from Docker hub
+    * in repoTags field. We use this constant to correctly identify requested
+    * image name.
     */
    public static final String PREFIX_DOCKER_HUB_HOST = "docker.io/";
 
    /**
-    * (Optional) Suffix used, when image version is not used during searching images.
+    * (Optional) Suffix used, when image version is not used during searching
+    * images.
     */
    public static final String SUFFIX_LATEST_VERSION = ":latest";
 
@@ -97,7 +103,7 @@ public class DockerComputeServiceAdapter implements
    @SuppressWarnings({ "rawtypes", "unchecked" })
    @Override
    public NodeAndInitialCredentials<Container> createNodeWithGroupEncodedIntoName(String group, String name,
-                                                                                  Template template) {
+         Template template) {
       checkNotNull(template, "template was null");
       TemplateOptions options = template.getOptions();
       checkNotNull(options, "template options was null");
@@ -129,15 +135,14 @@ public class DockerComputeServiceAdapter implements
             containerConfigBuilder.volumes(volumes);
          }
 
-         HostConfig.Builder hostConfigBuilder = HostConfig.builder()
-               .publishAllPorts(true)
+         HostConfig.Builder hostConfigBuilder = HostConfig.builder().publishAllPorts(true)
                .privileged(templateOptions.getPrivileged());
 
          if (!templateOptions.getPortBindings().isEmpty()) {
             Map<String, List<Map<String, String>>> portBindings = Maps.newHashMap();
             for (Map.Entry<Integer, Integer> entry : templateOptions.getPortBindings().entrySet()) {
-               portBindings.put(entry.getValue() + "/tcp",
-                     Lists.<Map<String, String>>newArrayList(ImmutableMap.of("HostIp", "0.0.0.0", "HostPort", Integer.toString(entry.getKey()))));
+               portBindings.put(entry.getValue() + "/tcp", Lists.<Map<String, String>> newArrayList(
+                     ImmutableMap.of("HostIp", "0.0.0.0", "HostPort", Integer.toString(entry.getKey()))));
             }
             hostConfigBuilder.portBindings(portBindings);
          }
@@ -193,7 +198,8 @@ public class DockerComputeServiceAdapter implements
          }
          for (String exposedPort : containerConfig.exposedPorts().keySet()) {
             if (!portBindings.containsKey(exposedPort)) {
-               portBindings.put(exposedPort, Lists.<Map<String, String>>newArrayList(ImmutableMap.of("HostIp", "0.0.0.0")));
+               portBindings.put(exposedPort,
+                     Lists.<Map<String, String>> newArrayList(ImmutableMap.of("HostIp", "0.0.0.0")));
             }
          }
          hostConfigBuilder = HostConfig.builder().fromHostConfig(containerConfig.hostConfig());
@@ -206,46 +212,53 @@ public class DockerComputeServiceAdapter implements
       containerConfig = containerConfigBuilder.build();
 
       logger.debug(">> creating new container with containerConfig(%s)", containerConfig);
-      Container container = api.getContainerApi().createContainer(name, containerConfig);
+      final ContainerApi containerApi = api.getContainerApi();
+      Container container = containerApi.createContainer(name, containerConfig);
       logger.trace("<< container(%s)", container.id());
 
       if (templateOptions.getNetworks() != null) {
-          logger.debug(">> connecting container(%s) to networks(%s)", container.id(), Iterables.toString(templateOptions.getNetworks()));
-          for (String networkIdOrName : templateOptions.getNetworks()) {
-              api.getNetworkApi().connectContainerToNetwork(networkIdOrName, container.id());
-          }
-          logger.trace("<< connected(%s)", container.id());
+         logger.debug(">> connecting container(%s) to networks(%s)", container.id(),
+               Iterables.toString(templateOptions.getNetworks()));
+         for (String networkIdOrName : templateOptions.getNetworks()) {
+            api.getNetworkApi().connectContainerToNetwork(networkIdOrName, container.id());
+         }
+         logger.trace("<< connected(%s)", container.id());
       }
 
       HostConfig hostConfig = containerConfig.hostConfig();
 
       logger.debug(">> starting container(%s) with hostConfig(%s)", container.id(), hostConfig);
-      api.getContainerApi().startContainer(container.id(), hostConfig);
+      containerApi.startContainer(container.id(), hostConfig);
       logger.trace("<< started(%s)", container.id());
 
-      container = api.getContainerApi().inspectContainer(container.id());
+      container = containerApi.inspectContainer(container.id());
       if (container.state().exitCode() != 0) {
+         logContainerLogs(container.id());
          destroyNode(container.id());
          throw new IllegalStateException(String.format("Container %s has not started correctly", container.id()));
       }
       return new NodeAndInitialCredentials(container, container.id(),
-              LoginCredentials.builder().user(loginUser).password(loginUserPassword).build());
+            LoginCredentials.builder().user(loginUser).password(loginUserPassword).build());
    }
 
    @Override
    public Iterable<Hardware> listHardwareProfiles() {
       Set<Hardware> hardware = Sets.newLinkedHashSet();
       // todo they are only placeholders at the moment
-      hardware.add(new HardwareBuilder().ids("micro").hypervisor("lxc").name("micro").processor(new Processor(1, 1)).ram(512).build());
-      hardware.add(new HardwareBuilder().ids("small").hypervisor("lxc").name("small").processor(new Processor(1, 1)).ram(1024).build());
-      hardware.add(new HardwareBuilder().ids("medium").hypervisor("lxc").name("medium").processor(new Processor(2, 1)).ram(2048).build());
-      hardware.add(new HardwareBuilder().ids("large").hypervisor("lxc").name("large").processor(new Processor(2, 1)).ram(3072).build());
+      hardware.add(new HardwareBuilder().ids("micro").hypervisor("lxc").name("micro").processor(new Processor(1, 1))
+            .ram(512).build());
+      hardware.add(new HardwareBuilder().ids("small").hypervisor("lxc").name("small").processor(new Processor(1, 1))
+            .ram(1024).build());
+      hardware.add(new HardwareBuilder().ids("medium").hypervisor("lxc").name("medium").processor(new Processor(2, 1))
+            .ram(2048).build());
+      hardware.add(new HardwareBuilder().ids("large").hypervisor("lxc").name("large").processor(new Processor(2, 1))
+            .ram(3072).build());
       return hardware;
    }
 
    /**
-    * Method based on {@link org.jclouds.docker.features.ImageApi#listImages()}. It retrieves additional
-    * information by inspecting each image.
+    * Method based on {@link org.jclouds.docker.features.ImageApi#listImages()}.
+    * It retrieves additional information by inspecting each image.
     *
     * @see org.jclouds.compute.ComputeServiceAdapter#listImages()
     */
@@ -253,12 +266,13 @@ public class DockerComputeServiceAdapter implements
    public Set<Image> listImages() {
       Set<Image> images = Sets.newHashSet();
       for (ImageSummary imageSummary : api.getImageApi().listImages()) {
-         // less efficient than just listImages but returns richer json that needs repoTags coming from listImages
+         // less efficient than just listImages but returns richer json that
+         // needs repoTags coming from listImages
          Image inspected = api.getImageApi().inspectImage(imageSummary.id());
          inspected = Image.create(inspected.id(), inspected.author(), inspected.comment(), inspected.config(),
-                    inspected.containerConfig(), inspected.parent(), inspected.created(), inspected.container(),
-                 inspected.dockerVersion(), inspected.architecture(), inspected.os(), inspected.size(),
-                    inspected.virtualSize(), imageSummary.repoTags());
+               inspected.containerConfig(), inspected.parent(), inspected.created(), inspected.container(),
+               inspected.dockerVersion(), inspected.architecture(), inspected.os(), inspected.size(),
+               inspected.virtualSize(), imageSummary.repoTags());
          images.add(inspected);
       }
       return images;
@@ -272,7 +286,8 @@ public class DockerComputeServiceAdapter implements
          return find(listImages(), new Predicate<Image>() {
             @Override
             public boolean apply(Image input) {
-               // Only attempt match on id as we should try to pull again anyway if using name
+               // Only attempt match on id as we should try to pull again anyway
+               // if using name
                return input.id().equals(imageIdOrName);
             }
          }, null);
@@ -288,7 +303,8 @@ public class DockerComputeServiceAdapter implements
    @Override
    public Iterable<Container> listNodes() {
       Set<Container> containers = Sets.newHashSet();
-      for (ContainerSummary containerSummary : api.getContainerApi().listContainers(ListContainerOptions.Builder.all(true))) {
+      for (ContainerSummary containerSummary : api.getContainerApi()
+            .listContainers(ListContainerOptions.Builder.all(true))) {
          // less efficient than just listNodes but returns richer json
          containers.add(api.getContainerApi().inspectContainer(containerSummary.id()));
       }
@@ -350,4 +366,45 @@ public class DockerComputeServiceAdapter implements
          }
       };
    }
+
+   /**
+    * If log level is at least INFO, then logs the container (with given ID)
+    * log.
+    * 
+    * @param containerId
+    *           Id of the container to retrieve logs for.
+    */
+   private void logContainerLogs(final String containerId) {
+      if (logger.isInfoEnabled()) {
+         DockerInputStream dis = null;
+         try {
+            dis = new DockerInputStream(api.getContainerApi().attach(containerId,
+                  AttachOptions.Builder.logs(true).stderr(true).stdout(true)));
+            String idToLog = containerId;
+            if (idToLog.length() > 8) {
+               idToLog = idToLog.substring(0, 8);
+            }
+            StdStreamData data = null;
+            while (null != (data = dis.readStdStreamData())) {
+               final byte[] bytePayload = data.getPayload();
+               final String payload = bytePayload != null ? new String(bytePayload, Charsets.UTF_8) : "";
+               switch (data.getType()) {
+                  case OUT:
+                     logger.info("Container [%s] StdOut: %s", idToLog, payload);
+                     break;
+                  case ERR:
+                     logger.info("Container [%s] StdErr: %s", idToLog, payload);
+                     break;
+                  default:
+                     logger.trace("Container [%s] - Unexpected STD stream type: %s", idToLog, data.getType());
+                     break;
+               }
+            }
+         } catch (Exception e) {
+            logger.info("Retrieving container log failed", e);
+         } finally {
+            Closeables2.closeQuietly(dis);
+         }
+      }
+   }   
 }
