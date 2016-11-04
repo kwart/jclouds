@@ -43,10 +43,10 @@ Find more details in [Control and configure Docker with systemd](https://docs.do
 
 ### Running live tests
 
-The `DOCKER_HOST` environment variable has to be configured as it's used as a value for `test.docker.endpoint` system property.
+The `test.docker.endpoint` system property has to be configured if
+the endpoint URL differs from `http://127.0.0.1:2375/`.
 
 ```
-export DOCKER_HOST="http://localhost:2375/"
 mvn -Plive integration-test
 ```
 
